@@ -1,0 +1,537 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: 生成工程文件
+        run: |
+          mkdir -p app/src/main/java/com/example/magnet
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MagnetDownloader"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.magnet"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.magnet"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+          }
+
+          dependencies {
+              implementation("org.libtorrent4j:libtorrent4j:1.2.19.0")
+              implementation("org.libtorrent4j:libtorrent4j-android-arm64:1.2.19.0")
+              implementation("org.libtorrent4j:libtorrent4j-android-arm:1.2.19.0")
+
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.2")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="磁力下载器"
+                  android:requestLegacyExternalStorage="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:usesCleartextTraffic="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.BROWSABLE" />
+                          <data android:scheme="magnet" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".DownloadService"
+                      android:exported="false"
+                      android:foregroundServiceType="dataSync" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/magnet/MainActivity.kt <<'EOF'
+          package com.example.magnet
+
+          import android.Manifest
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.IBinder
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.ServiceCompat
+          import androidx.core.content.ContextCompat
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.isActive
+          import kotlinx.coroutines.launch
+          import org.libtorrent4j.SessionHandle
+          import org.libtorrent4j.SessionManager
+          import org.libtorrent4j.TorrentFlags
+          import org.libtorrent4j.TorrentHandle
+          import org.libtorrent4j.TorrentStatus
+          import org.libtorrent4j.swig.torrent_flags_t
+          import java.io.File
+
+          /* ===================== 存储工具:/storage/emulated/0/Download ===================== */
+          object StorageHelper {
+
+              @Suppress("DEPRECATION")
+              fun downloadDir(): File =
+                  Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+
+              fun hasAccess(ctx: Context): Boolean =
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      Environment.isExternalStorageManager()
+                  } else {
+                      ContextCompat.checkSelfPermission(
+                          ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE
+                      ) == PackageManager.PERMISSION_GRANTED
+                  }
+
+              fun allFilesAccessIntent(ctx: Context): Intent =
+                  Intent(
+                      Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                      Uri.parse("package:${ctx.packageName}")
+                  )
+          }
+
+          /* ===================== 下载引擎 ===================== */
+          data class TorrentItem(
+              val hash: String,
+              val name: String,
+              val progress: Float,
+              val downSpeed: Int,
+              val upSpeed: Int,
+              val peers: Int,
+              val state: String,
+              val paused: Boolean,
+              val totalDone: Long,
+              val totalSize: Long
+          )
+
+          object TorrentEngine {
+              private val sm = SessionManager()
+              private var job: Job? = null
+              private var saveDir: File = StorageHelper.downloadDir()
+              private val pending = mutableListOf<String>()
+
+              private val _items = MutableStateFlow<List<TorrentItem>>(emptyList())
+              val items: StateFlow<List<TorrentItem>> = _items.asStateFlow()
+
+              @Synchronized
+              fun start(dir: File) {
+                  if (sm.isRunning) return
+                  saveDir = dir.apply { mkdirs() }
+                  sm.start()
+                  synchronized(pending) {
+                      pending.forEach { download(it) }
+                      pending.clear()
+                  }
+                  job = CoroutineScope(Dispatchers.Default).launch {
+                      while (isActive) {
+                          refresh()
+                          delay(1000)
+                      }
+                  }
+              }
+
+              @Synchronized
+              fun stop() {
+                  job?.cancel()
+                  if (sm.isRunning) sm.stop()
+                  _items.value = emptyList()
+              }
+
+              fun addMagnet(uri: String) {
+                  if (!uri.startsWith("magnet:")) return
+                  if (!sm.isRunning) {
+                      synchronized(pending) { pending.add(uri) }
+                      return
+                  }
+                  download(uri)
+              }
+
+              private fun download(uri: String) {
+                  Thread { sm.download(uri, saveDir, torrent_flags_t()) }.start()
+              }
+
+              private fun handles(): List<TorrentHandle> {
+                  val v = sm.swig().get_torrents()
+                  val n = v.size().toInt()
+                  val list = ArrayList<TorrentHandle>(n)
+                  for (i in 0 until n) list.add(TorrentHandle(v.get(i)))
+                  return list
+              }
+
+              private fun find(hash: String): TorrentHandle? =
+                  handles().firstOrNull { it.infoHash().toHex() == hash }
+
+              fun pause(hash: String) { find(hash)?.pause() }
+              fun resume(hash: String) { find(hash)?.resume() }
+
+              fun remove(hash: String, deleteFiles: Boolean) {
+                  val h = find(hash) ?: return
+                  if (deleteFiles) sm.remove(h, SessionHandle.DELETE_FILES) else sm.remove(h)
+              }
+
+              private fun refresh() {
+                  if (!sm.isRunning) return
+                  _items.value = handles().filter { it.isValid }.map { h ->
+                      val s = h.status()
+                      val paused = s.flags().and_(TorrentFlags.PAUSED).nonZero()
+                      TorrentItem(
+                          hash = h.infoHash().toHex(),
+                          name = s.name().ifEmpty { "获取元数据中… " + h.infoHash().toHex().take(8) },
+                          progress = s.progress(),
+                          downSpeed = s.downloadPayloadRate(),
+                          upSpeed = s.uploadPayloadRate(),
+                          peers = s.numPeers(),
+                          state = if (paused) "已暂停" else when (s.state()) {
+                              TorrentStatus.State.CHECKING_FILES -> "校验文件"
+                              TorrentStatus.State.DOWNLOADING_METADATA -> "获取元数据"
+                              TorrentStatus.State.DOWNLOADING -> "下载中"
+                              TorrentStatus.State.FINISHED -> "已完成"
+                              TorrentStatus.State.SEEDING -> "做种中"
+                              else -> "等待中"
+                          },
+                          paused = paused,
+                          totalDone = s.totalDone(),
+                          totalSize = s.totalWanted()
+                      )
+                  }
+              }
+          }
+
+          /* ===================== 前台服务 ===================== */
+          class DownloadService : Service() {
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val channelId = "download"
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(
+                      NotificationChannel(channelId, "下载服务", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val pi = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val notification = NotificationCompat.Builder(this, channelId)
+                      .setContentTitle("磁力下载器运行中")
+                      .setSmallIcon(android.R.drawable.stat_sys_download)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+
+                  ServiceCompat.startForeground(
+                      this, 1, notification,
+                      if (Build.VERSION.SDK_INT >= 29)
+                          ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC else 0
+                  )
+
+                  if (!StorageHelper.hasAccess(this)) {
+                      stopSelf()
+                      return
+                  }
+                  TorrentEngine.start(StorageHelper.downloadDir())
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+              override fun onDestroy() {
+                  TorrentEngine.stop()
+                  super.onDestroy()
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+
+          /* ===================== Activity ===================== */
+          class MainActivity : ComponentActivity() {
+
+              private var hasStorage by mutableStateOf(false)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  handleIntent(intent)
+
+                  setContent {
+                      MaterialTheme {
+                          Surface(Modifier.fillMaxSize()) {
+                              if (hasStorage) MainScreen()
+                              else PermissionScreen { hasStorage = StorageHelper.hasAccess(this@MainActivity) }
+                          }
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  hasStorage = StorageHelper.hasAccess(this)
+                  if (hasStorage) {
+                      ContextCompat.startForegroundService(this, Intent(this, DownloadService::class.java))
+                  }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  handleIntent(intent)
+              }
+
+              private fun handleIntent(intent: Intent?) {
+                  val uri = intent?.data?.toString() ?: return
+                  TorrentEngine.addMagnet(uri)
+              }
+          }
+
+          /* ===================== 界面 ===================== */
+          @Composable
+          fun PermissionScreen(onGranted: () -> Unit) {
+              val ctx = LocalContext.current
+
+              val legacyLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { granted ->
+                  if (granted) {
+                      onGranted()
+                      ContextCompat.startForegroundService(ctx, Intent(ctx, DownloadService::class.java))
+                  }
+              }
+
+              Column(
+                  Modifier.fillMaxSize().padding(24.dp),
+                  verticalArrangement = Arrangement.Center,
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Text("需要存储权限", style = MaterialTheme.typography.headlineSmall)
+                  Spacer(Modifier.height(12.dp))
+                  Text(
+                      "文件将保存到\n${StorageHelper.downloadDir().absolutePath}\n请授予存储权限后继续。",
+                      style = MaterialTheme.typography.bodyMedium
+                  )
+                  Spacer(Modifier.height(24.dp))
+                  Button(onClick = {
+                      if (Build.VERSION.SDK_INT >= 30) {
+                          ctx.startActivity(StorageHelper.allFilesAccessIntent(ctx))
+                      } else {
+                          legacyLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                      }
+                  }) { Text("授予权限") }
+              }
+          }
+
+          @Composable
+          fun MainScreen() {
+              val list by TorrentEngine.items.collectAsStateWithLifecycle()
+              var input by remember { mutableStateOf("") }
+
+              val notifyLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) {}
+              LaunchedEffect(Unit) {
+                  if (Build.VERSION.SDK_INT >= 33) notifyLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+              }
+
+              Column(Modifier.padding(16.dp).statusBarsPadding()) {
+                  Text("磁力下载器", style = MaterialTheme.typography.headlineSmall)
+                  Text(
+                      "保存位置:${StorageHelper.downloadDir().absolutePath}",
+                      style = MaterialTheme.typography.bodySmall
+                  )
+                  Spacer(Modifier.height(12.dp))
+                  OutlinedTextField(
+                      value = input,
+                      onValueChange = { input = it },
+                      label = { Text("粘贴 magnet:? 链接") },
+                      modifier = Modifier.fillMaxWidth()
+                  )
+                  Spacer(Modifier.height(8.dp))
+                  Button(
+                      onClick = { TorrentEngine.addMagnet(input.trim()); input = "" },
+                      enabled = input.trim().startsWith("magnet:"),
+                      modifier = Modifier.fillMaxWidth()
+                  ) { Text("开始下载") }
+
+                  Spacer(Modifier.height(16.dp))
+                  LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                      items(list, key = { it.hash }) { TorrentCard(it) }
+                  }
+              }
+          }
+
+          @Composable
+          fun TorrentCard(t: TorrentItem) {
+              Card(Modifier.fillMaxWidth()) {
+                  Column(Modifier.padding(12.dp)) {
+                      Text(t.name, maxLines = 2, style = MaterialTheme.typography.titleSmall)
+                      Spacer(Modifier.height(6.dp))
+                      LinearProgressIndicator(progress = { t.progress }, modifier = Modifier.fillMaxWidth())
+                      Spacer(Modifier.height(4.dp))
+                      Text(
+                          "${t.state}  ${"%.1f".format(t.progress * 100)}%  " +
+                                  "${fmt(t.totalDone)}/${fmt(t.totalSize)}",
+                          style = MaterialTheme.typography.bodySmall
+                      )
+                      Text(
+                          "↓ ${fmt(t.downSpeed.toLong())}/s   ↑ ${fmt(t.upSpeed.toLong())}/s   连接 ${t.peers}",
+                          style = MaterialTheme.typography.bodySmall
+                      )
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          TextButton(onClick = {
+                              if (t.paused) TorrentEngine.resume(t.hash) else TorrentEngine.pause(t.hash)
+                          }) { Text(if (t.paused) "继续" else "暂停") }
+                          TextButton(onClick = { TorrentEngine.remove(t.hash, false) }) { Text("删除任务") }
+                          TextButton(onClick = { TorrentEngine.remove(t.hash, true) }) { Text("删除+文件") }
+                      }
+                  }
+              }
+          }
+
+          fun fmt(b: Long): String = when {
+              b < 1024 -> "$b B"
+              b < 1024 * 1024 -> "%.1f KB".format(b / 1024.0)
+              b < 1024L * 1024 * 1024 -> "%.1f MB".format(b / 1048576.0)
+              else -> "%.2f GB".format(b / 1073741824.0)
+          }
+          EOF
+
+      - name: 编译 APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: 上传为构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: MagnetDownloader-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: 发布到 Releases(方便手机直接下载)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: 磁力下载器 build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
